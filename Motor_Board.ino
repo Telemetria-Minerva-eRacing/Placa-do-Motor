@@ -1,0 +1,191 @@
+// ============================================================================
+// SISTEMA DE CONTROLE - FÓRMULA SAE EV (MINERVA ERACING 2026)
+// Lógica de R2D, Buzzer, Leitura de APPS/BSE, Off-set 1V e Ignição
+// ============================================================================
+
+// --- MAPEAMENTO DE PINOS (Conforme image_7d719d.png) ---
+const int PIN_TPS1         = 32; // Entrada Analógica: TPS1_ESP32
+const int PIN_TPS2         = 33; // Entrada Analógica: TPS2_ESP32
+const int PIN_BSE          = 35; // Entrada Analógica: BSE_ESP32
+const int PIN_BOTAO_R2D    = 18; // Entrada Digital: R2D_ESP32 
+
+const int PIN_HABILITA     = 13; // Saída: HABILITA_ESP32 (Q3)
+const int PIN_BUZZER       = 19; // Saída: BUZZER_ESP32 (Q2)
+const int PIN_FREIAR       = 26; // Saída Dupla: FREIAR_ESP32 (Q1 e Q4)
+
+// --- NOVOS PINOS ADICIONADOS ---
+const int PIN_1V           = 27; // Saída: Referência de 1V
+const int PIN_IGNICAO_OUT  = 23; // Saída: Controle da Ignição (Alocado no D23 para software)
+
+// --- PARÂMETROS DE CALIBRAÇÃO (ADC 12-bits ESP32: 0 a 4095) ---
+const int LIMIAR_FREIO = 10;  // Pressão hidráulica mínima para frenagem
+
+// Calibração TPS1 (Normal: Tensão sobe ao pisar)
+const float TPS1_MIN = 400.0;  
+const float TPS1_MAX = 3600.0; 
+
+// Calibração TPS2 (Invertido: Tensão cai ao pisar)
+const float TPS2_MIN = 3600.0; 
+const float TPS2_MAX = 400.0;  
+
+// --- MÁQUINA DE ESTADOS (R2D) ---
+enum EstadoCarro {
+  DESLIGADO,
+  TOCANDO_BUZZER,
+  PRONTO_PARA_CORRER
+}
+
+EstadoCarro estadoAtual = DESLIGADO;
+unsigned long tempoInicioBuzzer = 0;
+const unsigned long TEMPO_BUZZER_MS = 2000; // Alerta sonoro de 2 segundos
+
+// --- VARIÁVEIS DE SEGURANÇA ---
+bool erroFreioAcelerador = false; // Trava para a regra EV.4.7
+
+// --- FUNÇÃO MATEMÁTICA DE PORCENTAGEM (0 a 100%) ---
+float calcularPorcentagem(int leituraRaw, float limiteSolto, float limiteFundo) {
+  float pct = ((float)leituraRaw - limiteSolto) / (limiteFundo - limiteSolto) * 100.0;
+  
+  if (pct < 0.0) return 0.0;
+  if (pct > 100.0) return 100.0;
+  return pct;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Configuração de Entradas
+  pinMode(PIN_TPS1, INPUT);
+  pinMode(PIN_TPS2, INPUT);
+  pinMode(PIN_BSE, INPUT);
+  pinMode(PIN_BOTAO_R2D, INPUT_PULLDOWN);
+
+  // Configuração de Saídas
+  pinMode(PIN_HABILITA, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_FREIAR, OUTPUT);
+  pinMode(PIN_1V, OUTPUT);
+  pinMode(PIN_IGNICAO_OUT, OUTPUT);
+
+  // Inicialização Segura / Estados Iniciais
+  digitalWrite(PIN_HABILITA, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
+  digitalWrite(PIN_FREIAR, LOW);
+  
+  // Ativa o off-set e a ignição assim que a placa recebe a baixa tensão
+  digitalWrite(PIN_1V, HIGH);          
+  digitalWrite(PIN_IGNICAO_OUT, HIGH); 
+
+  Serial.println("Minerva eRacing - Placa do Motor Inicializada.");
+}
+
+void loop() {
+  unsigned long agora = millis();
+
+  // ==========================================================================
+  // 1. CÁLCULO E VALIDAÇÃO DOS ACELERADORES (TPS)
+  // ==========================================================================
+  int rawTPS1 = analogRead(PIN_TPS1);
+  int rawTPS2 = analogRead(PIN_TPS2);
+
+  float pctTPS1 = calcularPorcentagem(rawTPS1, TPS1_MIN, TPS1_MAX);
+  float pctTPS2 = calcularPorcentagem(rawTPS2, TPS2_MIN, TPS2_MAX); 
+  float aceleracaoSaida = (pctTPS1 + pctTPS2) / 2.0;
+
+  // ==========================================================================
+  // 2. CONTROLE DE FRENAGEM E LUZ DE FREIO
+  // ==========================================================================
+  int rawBSE = analogRead(PIN_BSE); 
+  bool freioPressionado = (rawBSE > LIMIAR_FREIO);
+  
+  // Sinaliza frenagem fisicamente no pino D26
+  digitalWrite(PIN_FREIAR, freioPressionado ? HIGH : LOW);
+
+  // ==========================================================================
+  // 2.5 REGRA DE SEGURANÇA: FREIO + ACELERADOR (EV.4.7)
+  // ==========================================================================
+  
+  // 1. Condição de disparo: Freio pressionado e acelerador acima de 25%
+  if (freioPressionado && aceleracaoSaida > 25.0) {
+    erroFreioAcelerador = true;
+  }
+
+  // 2. Condição de rearme: Manter freio solto ou pressionado não importa,
+  // mas o acelerador obrigatoriamente deve cair para menos de 5%
+  if (erroFreioAcelerador && aceleracaoSaida < 5.0) {
+    erroFreioAcelerador = false;
+  }
+
+  // 3. Ação: Cortar o torque forçando a saída de aceleração para 0%
+  if (erroFreioAcelerador) {
+    aceleracaoSaida = 0.0;
+  }
+
+  // ==========================================================================
+  // 3. MÁQUINA DE ESTADOS - REGRAS DE SEGURANÇA (R2D)
+  // ==========================================================================
+  
+  // Lendo o botão físico!
+  bool botaoR2DPressionado = (digitalRead(PIN_BOTAO_R2D) == HIGH);
+  
+  switch (estadoAtual) {
+    
+    case DESLIGADO:
+      if (freioPressionado && botaoR2DPressionado) {
+        tempoInicioBuzzer = agora;
+        digitalWrite(PIN_BUZZER, HIGH); 
+        estadoAtual = TOCANDO_BUZZER;
+        Serial.println("Validacao concluida: Freio + Botao acionados. Buzzer LIGADO.");
+      }
+      break;
+
+    case TOCANDO_BUZZER:
+      if ((agora - tempoInicioBuzzer) >= TEMPO_BUZZER_MS) {
+        digitalWrite(PIN_BUZZER, LOW);     
+        digitalWrite(PIN_HABILITA, HIGH);  
+        estadoAtual = PRONTO_PARA_CORRER;
+        Serial.println("Aviso sonoro finalizado. Veiculo ENERGIZADO e apto para movimentacao.");
+      }
+      break;
+
+    case PRONTO_PARA_CORRER:
+      // Veículo liberado para pista.
+      break;
+  }
+
+  // ==========================================================================
+  // 4. BLOCO DE CALIBRAÇÃO DOS PEDAIS (APPS) - Imprime 1 vez por segundo
+  // ==========================================================================
+  static unsigned long ultimoPrintCalibracao = 0;
+  
+  if (agora - ultimoPrintCalibracao >= 1000) {
+    ultimoPrintCalibracao = agora;
+    
+    // Imprime os valores puros (Raw) lidos pelo ADC do ESP32 (0 a 4095)
+    Serial.printf("CALIBRACAO -> TPS1: %d | TPS2: %d | Saida APPS: %.1f%% %s\n", 
+                  rawTPS1, rawTPS2, aceleracaoSaida, 
+                  erroFreioAcelerador ? "[CORTE EV.4.7 ATIVO!]" : "");
+  }
+
+  // ==========================================================================
+  // 5. STATUS DOS PINOS DE SAÍDA
+  // ==========================================================================
+  static unsigned long ultimoPrintTrava = 0;
+  
+  if (agora - ultimoPrintTrava >= 1000) {
+    ultimoPrintTrava = agora;
+    
+    // Lê o estado FÍSICO dos pinos de saída
+    bool statusHabilita   = digitalRead(PIN_HABILITA);
+    bool statusBrakeLight = digitalRead(PIN_FREIAR);
+    bool statusBuzzer     = digitalRead(PIN_BUZZER);
+
+    // Imprime na mesma linha para facilitar a leitura no monitor
+    Serial.print("[STATUS SAÍDAS] ");
+    Serial.printf("Habilita (D13): %s | ", statusHabilita ? "ON" : "OFF");
+    Serial.printf("Brakelight (D26): %s | ", statusBrakeLight ? "ON" : "OFF");
+    Serial.printf("Buzzer (D19): %s\n", statusBuzzer ? "ON" : "OFF");
+  }
+  
+  delay(10); 
+}
